@@ -173,6 +173,19 @@ export interface ListingInput {
   category: string; // e.g. "Appliances", "Household"
   condition: string; // "New" | "Used - Like New" | "Used - Good" | "Used - Fair"
   photos: string[]; // absolute paths
+  /**
+   * Extra fields under "More details", keyed by the label the form shows, e.g.
+   * { "Marca": "Whirlpool" } or { "Tipo de bicicleta": "Bicicleta de montaña",
+   * "Material": "Aluminio" }. Which fields exist depends on the category.
+   */
+  details?: Record<string, string>;
+}
+
+export interface FilledDraft {
+  screenshot: Buffer;
+  /** Fields from `details` that were filled, and the ones that could not be. */
+  filled: string[];
+  problems: string[];
 }
 
 /** Every image in a folder, sorted. Lets callers pass a folder instead of paths. */
@@ -226,6 +239,8 @@ async function gotoCreate(page: Page): Promise<void> {
  */
 async function pickFromCombobox(page: Page, comboLabels: readonly string[], optionTexts: string[]): Promise<void> {
   const box = page.locator(comboLabels.map((l) => `label[role=combobox]:has-text("${l}")`).join(", ")).first();
+  // Texts visible before opening, so the popup's own options can be told apart.
+  const before: string[] = await page.evaluate(visibleLeafTexts);
   await box.click({ timeout: 15000 });
   await page.waitForTimeout(1200);
 
@@ -244,7 +259,13 @@ async function pickFromCombobox(page: Page, comboLabels: readonly string[], opti
 
     const match = options.find((o) => wanted.includes(o.toLowerCase()));
     if (match) {
-      await page.locator(`span:text-is(${JSON.stringify(match)})`).first().click({ timeout: 10000 });
+      // The popup is portalled to the end of the document, so the last visible
+      // span with this text is the option, not the same words in the preview.
+      await page
+        .locator(`span:text-is(${JSON.stringify(match)})`)
+        .filter({ visible: true })
+        .last()
+        .click({ timeout: 10000 });
       await page.waitForTimeout(800);
       return;
     }
@@ -252,32 +273,79 @@ async function pickFromCombobox(page: Page, comboLabels: readonly string[], opti
     // Scroll the popup. Walk up from a known category option to the nearest
     // ancestor that is an actual scroll container (overflow auto/scroll); a
     // bare scrollHeight check stops at clipped text spans and scrolls nothing.
-    const moved = await page.evaluate(() => {
-      const anchor = [...document.querySelectorAll("span")].find(
-        (s) =>
-          s.offsetParent &&
-          !s.children.length &&
-          /^(Tools|Furniture|Household|Garden|Appliances|Herramientas|Muebles|Hogar|Jardinería|Electrodomésticos)$/.test(
-            (s.textContent || "").trim()
-          )
-      );
+    const moved = await page.evaluate((known: string[]) => {
+      const old = new Set(known);
+      // Any option that only appeared once the popup opened sits inside it.
+      const anchor = [...document.querySelectorAll("span")].find((s) => {
+        const t = (s.textContent || "").trim();
+        return s.offsetParent && !s.children.length && t.length > 0 && t.length < 50 && !old.has(t);
+      });
       let el: HTMLElement | null = (anchor?.parentElement as HTMLElement) ?? null;
       while (el && !(el.scrollHeight > el.clientHeight + 4 && /auto|scroll/.test(getComputedStyle(el).overflowY))) {
         el = el.parentElement;
       }
       if (!el) return false;
       const before = el.scrollTop;
+      const top = el.scrollTop;
       el.scrollTop += 220;
-      return el.scrollTop !== before;
-    });
+      return el.scrollTop !== top;
+    }, before);
     await page.waitForTimeout(350);
     if (!moved && i > 3) break;
   }
 
   await page.keyboard.press("Escape").catch(() => {});
+  const old = new Set(before);
+  const offered = [...seen].filter((t) => !old.has(t));
   throw new Error(
-    `"${optionTexts[0]}" is not an option for ${comboLabels.join(" / ")}. Available: ${[...seen].join(", ") || "(none found)"}`
+    `"${optionTexts[0]}" is not an option for ${comboLabels.join(" / ")}. Available: ${offered.join(", ") || "(none found)"}`
   );
+}
+
+/** Short visible leaf span texts on the page (runs in the browser). */
+function visibleLeafTexts(): string[] {
+  return [...document.querySelectorAll("span")]
+    .filter((s) => (s as HTMLElement).offsetParent && !s.children.length)
+    .map((s) => (s.textContent || "").trim())
+    .filter((t) => t.length > 0 && t.length < 50);
+}
+
+/** Labels of the optional fields the form currently shows, for error messages. */
+async function formFieldLabels(page: Page): Promise<string[]> {
+  return page.evaluate(() => {
+    const out = new Set<string>();
+    for (const l of document.querySelectorAll("label")) {
+      if (!(l as HTMLElement).offsetParent) continue;
+      if (!l.querySelector("input, textarea") && l.getAttribute("role") !== "combobox") continue;
+      const first = [...l.querySelectorAll("span")].map((s) => (s.textContent || "").trim()).find((t) => t.length > 0);
+      if (first) out.add(first);
+    }
+    return [...out];
+  });
+}
+
+/**
+ * Fill one optional field by its visible label: a text input when there is
+ * one, otherwise a dropdown. Returns an error message instead of throwing so
+ * one unknown field does not throw away an otherwise complete draft.
+ */
+async function fillDetail(page: Page, label: string, value: string): Promise<string | null> {
+  const input = page.locator(`label:has(span:text-is(${JSON.stringify(label)})) input`).first();
+  if ((await input.count()) > 0) {
+    await input.fill(value);
+    await page.waitForTimeout(400);
+    return null;
+  }
+  const combo = page.locator(`label[role=combobox]:has(span:text-is(${JSON.stringify(label)}))`).first();
+  if ((await combo.count()) > 0) {
+    try {
+      await pickFromCombobox(page, [label], [value]);
+      return null;
+    } catch (e) {
+      return e instanceof Error ? e.message : String(e);
+    }
+  }
+  return `No field "${label}" on this form. Fields shown: ${(await formFieldLabels(page)).join(", ")}`;
 }
 
 /**
@@ -285,7 +353,7 @@ async function pickFromCombobox(page: Page, comboLabels: readonly string[], opti
  * confirm. Returns a PNG screenshot of the filled form with Facebook's live
  * preview beside it.
  */
-export async function fillListing(input: ListingInput): Promise<Buffer> {
+export async function fillListing(input: ListingInput): Promise<FilledDraft> {
   for (const p of input.photos) {
     if (!fs.existsSync(p)) throw new Error(`Photo not found: ${p}`);
   }
@@ -309,6 +377,14 @@ export async function fillListing(input: ListingInput): Promise<Buffer> {
   if (!desc) await clickButton(page, UI.moreDetails, 5000);
   await (await labelled(page, UI.description, "textarea")).fill(input.description);
 
+  const filled: string[] = [];
+  const problems: string[] = [];
+  for (const [label, value] of Object.entries(input.details ?? {})) {
+    const err = await fillDetail(page, label, value);
+    if (err) problems.push(err);
+    else filled.push(`${label}: ${value}`);
+  }
+
   // Deliberately do NOT click Next here. On a live es-AR account the Next
   // click alone once published the listing (the review step's Publish button
   // was already spinning in the screenshot taken 2.5s later, with nothing else
@@ -317,7 +393,7 @@ export async function fillListing(input: ListingInput): Promise<Buffer> {
   await waitForUploads(page);
   await page.evaluate(() => window.scrollTo(0, 0)).catch(() => {});
   await page.waitForTimeout(800);
-  return await page.screenshot();
+  return { screenshot: await page.screenshot(), filled, problems };
 }
 
 /** Wait (bounded) until Next is enabled, which is how the form signals the photos finished uploading. */
@@ -343,7 +419,10 @@ async function waitForUploads(page: Page, timeout = 60000): Promise<void> {
  * anything is published, which catches a field that silently failed to fill.
  */
 export async function postListing(input: ListingInput): Promise<{ screenshot: Buffer; url: string }> {
-  const screenshot = await fillListing(input);
+  const { screenshot, problems } = await fillListing(input);
+  if (problems.length) {
+    throw new Error(`Stopping before publish, some details could not be filled. Nothing was posted.\n${problems.join("\n")}`);
+  }
 
   const page = await getPage();
   const review = await page.innerText("body");

@@ -31,7 +31,9 @@ async function launch(channel?: string): Promise<BrowserContext> {
     headless: false,
     channel,
     viewport: null,
-    args: ["--disable-blink-features=AutomationControlled"],
+    // Muted: Messenger chimes on every new message, and the window is usually on a
+    // virtual display where nobody wants to hear it.
+    args: ["--disable-blink-features=AutomationControlled", "--mute-audio"],
   });
 }
 

@@ -2,24 +2,20 @@ import type { Page } from "playwright";
 import { getContext } from "./browser.js";
 
 /**
- * Marketplace inbox: list buyer threads, read one, send one reply.
+ * Marketplace conversations: list them, read one, send one reply.
+ *
+ * Every conversation has a unique Messenger thread id (the number in
+ * facebook.com/messages/t/<id>). list_inbox returns it, and read/send open the
+ * thread by that id directly. Matching by name used to pick the wrong chat
+ * when two buyers shared a name ("Lautaro" twice) or one name contained
+ * another ("Mar" inside "Marcelo").
  *
  * Everything runs in its OWN tab of the dedicated browser and closes it after,
  * so a create_listing draft sitting in the main tab is never navigated away.
- *
- * A thread is identified by buyer name AND a piece of the listing title, and
- * the pair must match exactly one thread: matching on a first name alone once
- * opened the wrong conversation (two buyers called Ariel).
  */
 
-const INBOX_URL = "https://www.facebook.com/marketplace/inbox";
-const ROWS = "[role=main] [role=button], [role=main] a, [role=main] [role=row]";
-
-export type InboxTab = "selling" | "buying";
-const TAB_NAMES: Record<InboxTab, string[]> = {
-  selling: ["Venta", "Selling"],
-  buying: ["Compra", "Buying"],
-};
+const MESSAGES_URL = "https://www.facebook.com/messages/t/";
+const ID_RE = /^\d{5,25}$/;
 
 async function withTab<T>(fn: (page: Page) => Promise<T>): Promise<T> {
   const ctx = await getContext();
@@ -31,21 +27,8 @@ async function withTab<T>(fn: (page: Page) => Promise<T>): Promise<T> {
   }
 }
 
-async function openInbox(page: Page, tab: InboxTab): Promise<void> {
-  await page.goto(INBOX_URL, { waitUntil: "domcontentloaded", timeout: 60000 });
-  await page.waitForTimeout(5000);
-  for (const name of TAB_NAMES[tab]) {
-    const t = page.getByRole("tab", { name, exact: true }).first();
-    if ((await t.count()) > 0) {
-      await t.click({ timeout: 10000 });
-      await page.waitForTimeout(2500);
-      return;
-    }
-  }
-  throw new Error(`Inbox tab not found (${TAB_NAMES[tab].join(" / ")}) at ${page.url()}`);
-}
-
 export interface InboxRow {
+  id: string;
   buyer: string;
   listing: string;
   preview: string;
@@ -53,113 +36,115 @@ export interface InboxRow {
 }
 
 const WHEN_RE =
-  /^(\d{1,2}:\d{2}\s*(am|pm)?|Lun|Mar|Mié|Jue|Vie|Sáb|Dom|Mon|Tue|Wed|Thu|Fri|Sat|Sun|\d+\s*(min|h|d|sem|w)|\d{1,2}\/\d{1,2}(\/\d{2,4})?)$/i;
+  /^(\d{1,2}:\d{2}\s*(am|pm)?|Lun|Mar|Mié|Jue|Vie|Sáb|Dom|Mon|Tue|Wed|Thu|Fri|Sat|Sun|\d+\s*(min|h|d|días?|sem|w)|\d{1,2}\/\d{1,2}(\/\d{2,4})?)$/i;
 
-function parseRow(raw: string): InboxRow | null {
-  const parts = raw
+/** Open Messenger's "Marketplace" folder, which lists every buyer thread. */
+async function openMarketplaceFolder(page: Page): Promise<void> {
+  await page.goto(MESSAGES_URL, { waitUntil: "domcontentloaded", timeout: 60000 });
+  await page.waitForTimeout(6000);
+  const folder = page.locator("[role=row]").filter({ hasText: /^\s*Marketplace\s/ }).first();
+  if ((await folder.count()) === 0) throw new Error(`Marketplace folder not found in Messenger at ${page.url()}`);
+  await folder.click({ timeout: 10000 });
+  await page.waitForTimeout(4000);
+}
+
+function parseRow(href: string, raw: string): InboxRow | null {
+  const id = href.match(/\/messages\/t\/(\d+)/)?.[1];
+  if (!id) return null;
+  const lines = raw
     .split("\n")
     .map((s) => s.trim())
-    .filter((s) => s.length > 0);
-  const i = parts.findIndex((p) => p.startsWith("·"));
-  if (i < 1) return null;
-  const rest = parts.slice(i + 1);
-  const when = rest.length > 1 && WHEN_RE.test(rest[rest.length - 1]) ? rest.pop()! : "";
+    .filter((s) => s.length > 0 && s !== "·");
+  if (lines.length === 0) return null;
+  const sep = lines[0].indexOf(" · ");
+  if (sep < 1) return null; // not a "Buyer · Listing" Marketplace thread
+  const rest = lines.slice(1);
+  let when = "";
+  if (rest.length && WHEN_RE.test(rest[rest.length - 1])) when = rest.pop()!;
   return {
-    buyer: parts[0],
-    listing: parts[i].replace(/^·\s*/, ""),
-    preview: rest.join(" ").slice(0, 200),
+    id,
+    buyer: lines[0].slice(0, sep).trim(),
+    listing: lines[0].slice(sep + 3).trim(),
+    preview: rest.join(" ").replace(/\s*·\s*$/, "").slice(0, 200),
     when,
   };
 }
 
-/** Scroll the thread list so older rows load. */
-async function loadMore(page: Page, rounds: number): Promise<void> {
-  for (let i = 0; i < rounds; i++) {
-    await page.mouse.move(400, 700);
-    await page.mouse.wheel(0, 1500);
-    await page.waitForTimeout(1000);
-  }
-}
-
 async function readRows(page: Page): Promise<InboxRow[]> {
-  const raws: string[] = await page.evaluate(
-    (sel) => [...document.querySelectorAll(sel)].map((e) => (e as HTMLElement).innerText || ""),
-    ROWS
+  const raws: [string, string][] = await page.evaluate(() =>
+    [...document.querySelectorAll("a[href*='/messages/t/']")].map(
+      (a) => [a.getAttribute("href") || "", (a as HTMLElement).innerText || ""] as [string, string]
+    )
   );
   const seen = new Set<string>();
   const rows: InboxRow[] = [];
-  for (const r of raws) {
-    const row = parseRow(r);
-    if (!row) continue;
-    const key = `${row.buyer}\u0000${row.listing}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
+  for (const [href, raw] of raws) {
+    const row = parseRow(href, raw);
+    if (!row || seen.has(row.id)) continue;
+    seen.add(row.id);
     rows.push(row);
   }
   return rows;
 }
 
-export async function listInbox(tab: InboxTab = "selling", scrolls = 3): Promise<InboxRow[]> {
+/** Scroll the chat list so older threads load, collecting rows as they render. */
+async function collect(page: Page, scrolls: number): Promise<InboxRow[]> {
+  const byId = new Map<string, InboxRow>();
+  for (let i = 0; i <= scrolls; i++) {
+    for (const r of await readRows(page)) if (!byId.has(r.id)) byId.set(r.id, r);
+    if (i === scrolls) break;
+    await page.mouse.move(180, 700);
+    await page.mouse.wheel(0, 1500);
+    await page.waitForTimeout(1200);
+  }
+  return [...byId.values()];
+}
+
+export async function listInbox(scrolls = 3): Promise<InboxRow[]> {
   return withTab(async (page) => {
-    await openInbox(page, tab);
-    await loadMore(page, scrolls);
-    return readRows(page);
+    await openMarketplaceFolder(page);
+    return collect(page, scrolls);
   });
 }
 
-/**
- * Find the one thread whose buyer equals `buyer` (case-insensitive) and whose
- * listing title contains `listing`, scrolling for older rows if needed. Throws
- * with the candidates when there are none or several.
- */
-async function findThread(page: Page, buyer: string, listing: string): Promise<InboxRow> {
-  const b = buyer.trim().toLowerCase();
-  const l = listing.trim().toLowerCase();
-  let rows: InboxRow[] = [];
-  for (let i = 0; i < 8; i++) {
-    rows = await readRows(page);
-    const hits = rows.filter((r) => r.buyer.toLowerCase() === b && r.listing.toLowerCase().includes(l));
-    if (hits.length === 1) return hits[0];
-    if (hits.length > 1) {
-      throw new Error(
-        `"${buyer}" + "${listing}" matches several threads: ${hits.map((h) => `${h.buyer} · ${h.listing}`).join("; ")}. Pass more of the listing title.`
-      );
+/** "Escribe en <buyer> · <listing>" / "Write to <buyer> · <listing>" */
+const COMPOSER_LABEL = /^(?:Escribe en|Write to|Message)\s+(.+?)\s+·\s+(.+)$/;
+
+function composer(page: Page) {
+  return page.locator("[contenteditable=true][role=textbox]").filter({ visible: true }).first();
+}
+
+/** Open the thread by id and name it from its composer label. */
+async function openThread(page: Page, id: string): Promise<{ row: InboxRow; canWrite: boolean }> {
+  if (!ID_RE.test(id)) throw new Error(`"${id}" is not a thread id. Use the id from list_inbox.`);
+  await page.goto(`${MESSAGES_URL}${id}/`, { waitUntil: "domcontentloaded", timeout: 60000 });
+  await page.waitForTimeout(6000);
+  if (!page.url().includes(`/messages/t/${id}`)) {
+    throw new Error(`Thread ${id} did not open (landed on ${page.url()}). It may have been deleted.`);
+  }
+  const box = composer(page);
+  const canWrite = (await box.count()) > 0;
+  let buyer = "";
+  let listing = "";
+  if (canWrite) {
+    const m = ((await box.getAttribute("aria-label")) || "").match(COMPOSER_LABEL);
+    if (m) [, buyer, listing] = m;
+  }
+  if (!buyer) {
+    // Left or read-only threads have no composer: fall back to the page header.
+    const head = await page.evaluate(() => {
+      const h = [...document.querySelectorAll("[role=main] h2, [role=main] h1, [role=main] [role=heading]")]
+        .map((e) => (e as HTMLElement).innerText || "")
+        .find((t) => t.includes(" · "));
+      return h || "";
+    });
+    const sep = head.indexOf(" · ");
+    if (sep > 0) {
+      buyer = head.slice(0, sep).trim();
+      listing = head.slice(sep + 3).trim();
     }
-    await loadMore(page, 1);
   }
-  const sameBuyer = rows.filter((r) => r.buyer.toLowerCase().includes(b));
-  throw new Error(
-    `No thread with buyer "${buyer}" on a listing containing "${listing}". ` +
-      (sameBuyer.length
-        ? `Threads with that name: ${sameBuyer.map((r) => `${r.buyer} · ${r.listing}`).join("; ")}`
-        : `Threads seen: ${rows.map((r) => `${r.buyer} · ${r.listing}`).join("; ")}`)
-  );
-}
-
-/** The composer of the chat "<buyer> · <listing>": its aria-label names both. */
-function composerFor(page: Page, row: InboxRow) {
-  return page
-    .locator("[contenteditable=true][role=textbox]")
-    .filter({ visible: true })
-    .and(page.locator(`[aria-label*=${JSON.stringify(row.buyer)}]`))
-    .and(page.locator(`[aria-label*=${JSON.stringify(row.listing.slice(0, 40))}]`))
-    .first();
-}
-
-async function openThread(page: Page, buyer: string, listing: string, tab: InboxTab): Promise<InboxRow> {
-  await openInbox(page, tab);
-  const row = await findThread(page, buyer, listing);
-  await page
-    .locator(ROWS)
-    .filter({ hasText: row.buyer })
-    .filter({ hasText: row.listing })
-    .first()
-    .click({ timeout: 10000 });
-  await page.waitForTimeout(4000);
-  if ((await composerFor(page, row).count()) === 0) {
-    throw new Error(`Clicked the row but the chat "${row.buyer} · ${row.listing}" did not open.`);
-  }
-  return row;
+  return { row: { id, buyer, listing, preview: "", when: "" }, canWrite };
 }
 
 export interface ThreadMessage {
@@ -172,29 +157,16 @@ const SAFETY_NOTICE = /^(Si te vas a reunir con alguien en persona|If you're mee
 const STARTED = /inició este chat\.?$|started this chat\.?$/;
 
 /**
- * Messages of the open chat for `row`, oldest first. Each bubble carries an
- * aria-label "Presionar Enter, Mensaje enviado <time> por <who>: <text>",
- * which is far more stable than the rendered layout.
+ * Messages of the open thread, oldest first. Each bubble carries an aria-label
+ * "Presionar Enter, Mensaje enviado <time> por <who>: <text>", which is far
+ * more stable than the rendered layout. The page shows one thread, so the
+ * whole main area is the scope.
  */
-async function readMessages(page: Page, row: InboxRow): Promise<ThreadMessage[]> {
-  const labels: string[] = await page.evaluate(
-    ({ buyer, listing }) => {
-      // Scope to the chat whose composer names this thread, when it can be found.
-      const box = [...document.querySelectorAll("[contenteditable=true][role=textbox]")].find((b) => {
-        const al = b.getAttribute("aria-label") || "";
-        return al.includes(buyer) && al.includes(listing);
-      });
-      let scope: Element = document.body;
-      if (box) {
-        let el: Element | null = box;
-        while (el && !el.querySelector('[aria-label*="Mensaje enviado"], [aria-label*="Message sent"]')) el = el.parentElement;
-        if (el) scope = el;
-      }
-      return [...scope.querySelectorAll("[aria-label]")]
-        .map((e) => e.getAttribute("aria-label") || "")
-        .filter((a) => /Mensaje enviado|Message sent/.test(a));
-    },
-    { buyer: row.buyer, listing: row.listing.slice(0, 40) }
+async function readMessages(page: Page): Promise<ThreadMessage[]> {
+  const labels: string[] = await page.evaluate(() =>
+    [...(document.querySelector("[role=main]") || document.body).querySelectorAll("[aria-label]")]
+      .map((e) => e.getAttribute("aria-label") || "")
+      .filter((a) => /^(Presionar Enter, )?(Mensaje enviado|Message sent)|^(Press Enter, )?Message sent/.test(a))
   );
 
   const out: ThreadMessage[] = [];
@@ -213,15 +185,13 @@ async function readMessages(page: Page, row: InboxRow): Promise<ThreadMessage[]>
 }
 
 export async function readThread(
-  buyer: string,
-  listing: string,
-  tab: InboxTab = "selling"
-): Promise<{ thread: InboxRow; messages: ThreadMessage[]; screenshot: Buffer }> {
+  id: string
+): Promise<{ thread: InboxRow; messages: ThreadMessage[]; canWrite: boolean; screenshot: Buffer }> {
   return withTab(async (page) => {
-    const row = await openThread(page, buyer, listing, tab);
-    const messages = await readMessages(page, row);
+    const { row, canWrite } = await openThread(page, id);
+    const messages = await readMessages(page);
     const screenshot = await page.screenshot();
-    return { thread: row, messages, screenshot };
+    return { thread: row, messages, canWrite, screenshot };
   });
 }
 
@@ -236,17 +206,18 @@ export type SendResult =
  * Send exactly one message to one thread. Never retries: if delivery cannot be
  * confirmed, it says so and the caller must look before trying again, because
  * a blind retry is how a buyer ends up with the same message twice.
+ *
+ * `expectBuyer`, when given, must equal the thread's buyer name: a cheap guard
+ * against a mistyped id sending to the wrong person.
  */
-export async function sendMessage(
-  buyer: string,
-  listing: string,
-  text: string,
-  tab: InboxTab = "selling",
-  dryRun = false
-): Promise<SendResult> {
+export async function sendMessage(id: string, text: string, expectBuyer?: string, dryRun = false): Promise<SendResult> {
   return withTab(async (page) => {
-    const row = await openThread(page, buyer, listing, tab);
-    const before = await readMessages(page, row);
+    const { row, canWrite } = await openThread(page, id);
+    if (!canWrite) throw new Error(`Thread ${id} (${row.buyer} · ${row.listing}) has no message box: you may have left it. Nothing was sent.`);
+    if (expectBuyer && norm(expectBuyer).toLowerCase() !== norm(row.buyer).toLowerCase()) {
+      throw new Error(`Thread ${id} belongs to "${row.buyer}", not "${expectBuyer}". Nothing was sent.`);
+    }
+    const before = await readMessages(page);
     const want = norm(text);
 
     if (before.some((m) => ME.test(m.from) && norm(m.text) === want)) {
@@ -259,7 +230,7 @@ export async function sendMessage(
       };
     }
 
-    const box = composerFor(page, row);
+    const box = composer(page);
     await box.click({ timeout: 10000 });
     // The composer can hold a leftover draft; clear it so only `text` goes out.
     await page.keyboard.press("ControlOrMeta+A");
@@ -283,7 +254,7 @@ export async function sendMessage(
     let after: ThreadMessage[] = before;
     for (let i = 0; i < 10; i++) {
       await page.waitForTimeout(1000);
-      after = await readMessages(page, row);
+      after = await readMessages(page);
       const mine = after.filter((m) => ME.test(m.from));
       if (mine.length && norm(mine[mine.length - 1].text) === want) {
         return { status: "sent", thread: row, messages: after, screenshot: await page.screenshot() };

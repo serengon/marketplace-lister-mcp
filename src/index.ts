@@ -262,14 +262,30 @@ server.tool(
   }
 );
 
-process.on("SIGINT", async () => {
-  await closeContext();
+/**
+ * Shut down (closing the browser) when the client goes away. Claude Code's
+ * /mcp reconnect stops the wrapper (xvfb-run -> npx) but not always this node
+ * process, which then kept Chrome running and holding the profile lock, so the
+ * new server could not launch a browser. Losing stdin means the client is gone.
+ */
+let shuttingDown = false;
+async function shutdown(): Promise<never> {
+  if (!shuttingDown) {
+    shuttingDown = true;
+    const force = setTimeout(() => process.exit(0), 5000);
+    force.unref();
+    await closeContext();
+  }
   process.exit(0);
-});
-process.on("SIGTERM", async () => {
-  await closeContext();
-  process.exit(0);
-});
+}
+for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"] as const) process.on(sig, () => void shutdown());
+process.stdin.on("end", () => void shutdown());
+process.stdin.on("close", () => void shutdown());
+// Backstop: if the process that started us dies and we get re-parented, leave too.
+const startPpid = process.ppid;
+setInterval(() => {
+  if (process.ppid !== startPpid) void shutdown();
+}, 5000).unref();
 
 const transport = new StdioServerTransport();
 await server.connect(transport);

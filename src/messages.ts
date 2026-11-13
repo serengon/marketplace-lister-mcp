@@ -42,7 +42,7 @@ const WHEN_RE =
 async function openMarketplaceFolder(page: Page): Promise<void> {
   await page.goto(MESSAGES_URL, { waitUntil: "domcontentloaded", timeout: 60000 });
   await page.waitForTimeout(6000);
-  const folder = page.locator("[role=row]").filter({ hasText: /^\s*Marketplace\s/ }).first();
+  const folder = page.locator("[role=row]").filter({ hasText: /^\s*Marketplace/ }) // text runs together: "Marketplace6 mensajes nuevos".first();
   if ((await folder.count()) === 0) throw new Error(`Marketplace folder not found in Messenger at ${page.url()}`);
   await folder.click({ timeout: 10000 });
   await page.waitForTimeout(4000);

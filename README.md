@@ -137,5 +137,6 @@ For the curious. You never call these by name; Claude picks them.
 | `create_listing` | Fills the form and stops at the preview instead of posting, if you'd rather see the page first. |
 | `publish_listing` | Publishes a listing left at the preview by `create_listing`. |
 | `list_my_listings` | Shows your current listings and whether they're live yet. |
+| `renew_listing` | Renews (bumps) one active listing by its exact title so it resurfaces in search. Says so when Facebook does not offer it yet. |
 
 Settings, if you ever need them: `FB_MCP_PROFILE_DIR` moves where your login is stored, `FB_MCP_CHANNEL` picks a specific browser (`chrome` or `msedge`).

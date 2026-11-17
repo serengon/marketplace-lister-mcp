@@ -501,3 +501,81 @@ export async function listMine(): Promise<{ text: string; screenshot: Buffer }> 
   const screenshot = await page.screenshot();
   return { text, screenshot };
 }
+
+export interface RenewResult {
+  status: "renewed" | "not_offered" | "not_found" | "unconfirmed";
+  detail: string;
+  screenshot: Buffer;
+}
+
+/**
+ * Renew (bump) one active listing from the Selling page: its "More options"
+ * menu → "Renovar publicación". Facebook only offers it some days after
+ * publishing (seen on 8-day-old listings, absent on fresh ones); when the item
+ * is missing from the menu this reports the options it did show instead of
+ * guessing. No confirmation dialog follows on this account; success is the
+ * "Se renovó tu publicación" toast.
+ *
+ * The listing is matched by its title EXACTLY, so a near-duplicate title can
+ * never renew the wrong one.
+ */
+export async function renewListing(title: string): Promise<RenewResult> {
+  const page = await getPage();
+  await page.goto(SELLING_URL, { waitUntil: "domcontentloaded", timeout: 60000 });
+  await page.waitForTimeout(4000);
+
+  const labels = ["Más opciones para", "More options for"].map((p) => `${p} ${title}`);
+  let menuBtn = null;
+  for (const l of labels) {
+    const loc = page.locator(`[role=button][aria-label="${l.replace(/"/g, '\\"')}"]`).filter({ visible: true });
+    if ((await loc.count()) > 0) {
+      menuBtn = loc.first();
+      break;
+    }
+  }
+  if (!menuBtn) {
+    const titles = await page
+      .locator('[role=button][aria-label^="Más opciones para "], [role=button][aria-label^="More options for "]')
+      .evaluateAll((els) => [...new Set(els.map((e) => (e.getAttribute("aria-label") ?? "").replace(/^(Más opciones para|More options for) /, "")))]);
+    return {
+      status: "not_found",
+      detail: `No listing titled exactly "${title}". Titles on the Selling page:\n- ${titles.join("\n- ")}`,
+      screenshot: await page.screenshot(),
+    };
+  }
+
+  await menuBtn.scrollIntoViewIfNeeded();
+  await menuBtn.click({ timeout: 10000 });
+  await page.waitForTimeout(1500);
+
+  const renew = page.locator("[role=menuitem]").filter({ hasText: /^\s*(Renovar publicación|Renew listing)\s*$/ }).first();
+  if ((await renew.count()) === 0) {
+    const offered = await page.locator("[role=menuitem]").allInnerTexts();
+    // Right after a renewal the item reads "Renovar (7 días)": a countdown, not an action.
+    const wait = offered.map((s) => s.match(/^\s*(?:Renovar|Renew)\s*\(([^)]+)\)/i)).find(Boolean);
+    const screenshot = await page.screenshot();
+    await page.keyboard.press("Escape");
+    return {
+      status: "not_offered",
+      detail:
+        (wait ? `Already renewed recently; Facebook allows the next renewal in ${wait[1].trim()}. ` : "Facebook does not offer renewal for this listing right now. ") +
+        `Menu options: ${offered.map((s) => s.trim()).join(", ")}`,
+      screenshot,
+    };
+  }
+
+  await renew.click({ timeout: 10000 });
+  const toast = page.getByText(/Se renovó tu publicación|Your listing (was|has been) renewed/i).first();
+  const ok = await toast
+    .waitFor({ state: "visible", timeout: 10000 })
+    .then(() => true)
+    .catch(() => false);
+  const screenshot = await page.screenshot();
+  return ok
+    ? { status: "renewed", detail: (await toast.innerText()).trim(), screenshot }
+    : {
+        status: "unconfirmed",
+        detail: "Clicked 'Renovar publicación' but no confirmation appeared. Check the screenshot before retrying.",
+        screenshot,
+      };
+}

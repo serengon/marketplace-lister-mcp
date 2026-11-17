@@ -4,7 +4,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import { smoothLogin } from "./login.js";
 import { isLoggedIn, profileDir, closeContext } from "./browser.js";
-import { scanItems, fillListing, publishListing, postListing, listMine, photosInFolder } from "./listing.js";
+import { scanItems, fillListing, publishListing, postListing, listMine, photosInFolder, renewListing } from "./listing.js";
 import { searchComps } from "./comps.js";
 import { listInbox, readThread, sendMessage } from "./messages.js";
 
@@ -203,6 +203,23 @@ server.tool(
   }
 );
 
+
+server.tool(
+  "renew_listing",
+  "Renew (bump) ONE active listing so it resurfaces in Marketplace search, via its 'More options' menu on the Selling page. Free, and it changes nothing else in the listing. Facebook only offers it some days after publishing; if not offered, the result says so and lists the menu options instead. The listing is matched by its exact title as list_my_listings shows it. Ask the seller before renewing; approval to renew one listing does not cover others. Never retries: on 'unconfirmed', check list_my_listings before trying again.",
+  {
+    title: z.string().min(1).describe("The listing's title exactly as list_my_listings shows it."),
+  },
+  async ({ title }) => {
+    if (!(await isLoggedIn())) return { content: [text("Not logged in. Call fb_login first.")], isError: true };
+    const r = await renewListing(title);
+    const head = { renewed: "RENEWED", not_offered: "NOT OFFERED", not_found: "NOT FOUND", unconfirmed: "UNCONFIRMED" }[r.status];
+    return {
+      content: [text(`${head}: "${title}". ${r.detail}`), img(r.screenshot)],
+      isError: r.status === "not_found" || r.status === "unconfirmed",
+    };
+  }
+);
 
 const THREAD_ID = z.string().regex(/^\d{5,25}$/).describe("Thread id exactly as list_inbox shows it (the number in facebook.com/messages/t/<id>).");
 

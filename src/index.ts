@@ -4,7 +4,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import { smoothLogin } from "./login.js";
 import { isLoggedIn, profileDir, closeContext } from "./browser.js";
-import { scanItems, fillListing, publishListing, postListing, listMine, photosInFolder, renewListing } from "./listing.js";
+import { scanItems, fillListing, publishListing, postListing, listMine, photosInFolder, renewListing, checkRenewals } from "./listing.js";
 import { searchComps } from "./comps.js";
 import { listInbox, readThread, sendMessage } from "./messages.js";
 
@@ -199,7 +199,7 @@ server.tool(
   {},
   async () => {
     const { text: t, screenshot } = await listMine();
-    return { content: [text(t.slice(0, 4000)), img(screenshot)] };
+    return { content: [text(t.slice(0, 15000)), img(screenshot)] };
   }
 );
 
@@ -218,6 +218,19 @@ server.tool(
       content: [text(`${head}: "${title}". ${r.detail}`), img(r.screenshot)],
       isError: r.status === "not_found" || r.status === "unconfirmed",
     };
+  }
+);
+
+server.tool(
+  "check_renewals",
+  "For every listing on the Selling page, report whether Facebook offers renewal right now: AVAILABLE, WAIT <time> (renewed recently, countdown), or NONE (sold, under review or too new). Read-only: it opens each listing's 'More options' menu and closes it without clicking anything. Use it before asking the seller which listings to renew with renew_listing.",
+  {},
+  async () => {
+    if (!(await isLoggedIn())) return { content: [text("Not logged in. Call fb_login first.")], isError: true };
+    const { rows, screenshot } = await checkRenewals();
+    const line = (r: { title: string; state: string; wait?: string }) =>
+      `${r.state === "available" ? "AVAILABLE" : r.state === "wait" ? `WAIT ${r.wait}` : `NONE${r.wait ? ` (${r.wait})` : ""}`}: ${r.title}`;
+    return { content: [text(rows.length ? rows.map(line).join("\n") : "No listings found on the Selling page."), img(screenshot)] };
   }
 );
 

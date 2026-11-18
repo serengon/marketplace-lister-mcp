@@ -492,11 +492,73 @@ export interface MyListing {
   status: string;
 }
 
-/** Read the seller's current listings from the "Selling" page. */
-export async function listMine(): Promise<{ text: string; screenshot: Buffer }> {
-  const page = await getPage();
+const MENU_BTN = '[role=button][aria-label^="Más opciones para "], [role=button][aria-label^="More options for "]';
+const MENU_PREFIX = /^(Más opciones para|More options for) /;
+
+/** Distinct listing titles whose "More options" button is in the DOM. */
+async function menuTitles(page: Page): Promise<string[]> {
+  return page
+    .locator(MENU_BTN)
+    .evaluateAll((els, re) => [...new Set(els.map((e) => (e.getAttribute("aria-label") ?? "").replace(new RegExp(re), "")))], MENU_PREFIX.source);
+}
+
+/**
+ * The Selling page lazy-loads listings as you scroll: on load only the first
+ * few cards exist, so anything further down is invisible to locators. Scroll
+ * (wheel over the list, plus window.scrollTo as a fallback) until the number
+ * of listing menus stops growing, then return to the top.
+ */
+async function loadAllListings(page: Page, maxRounds = 20): Promise<void> {
+  let count = (await menuTitles(page)).length;
+  let stable = 0;
+  const vp = page.viewportSize() ?? { width: 1280, height: 860 };
+  for (let i = 0; i < maxRounds && stable < 3; i++) {
+    await page.mouse.move(vp.width * 0.6, vp.height * 0.6);
+    await page.mouse.wheel(0, 2500);
+    await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight)).catch(() => {});
+    await page.waitForTimeout(1200);
+    const n = (await menuTitles(page)).length;
+    stable = n > count ? 0 : stable + 1;
+    count = n;
+  }
+  await page.evaluate(() => window.scrollTo(0, 0)).catch(() => {});
+  await page.waitForTimeout(500);
+}
+
+/**
+ * The "More options" button of the listing titled exactly `title`, or null.
+ * If the page virtualises cards (drops them once scrolled past), the button may
+ * be gone after loadAllListings returned to the top, so walk down the page
+ * looking for it before giving up.
+ */
+async function findMenuButton(page: Page, title: string) {
+  const sel = ["Más opciones para", "More options for"]
+    .map((p) => `[role=button][aria-label="${`${p} ${title}`.replace(/"/g, '\\"')}"]`)
+    .join(", ");
+  const loc = page.locator(sel);
+  const vp = page.viewportSize() ?? { width: 1280, height: 860 };
+  for (let i = 0; i < 25; i++) {
+    if ((await loc.count()) > 0) return loc.first();
+    const before = await page.evaluate(() => window.scrollY).catch(() => 0);
+    await page.mouse.move(vp.width * 0.6, vp.height * 0.6);
+    await page.mouse.wheel(0, 700);
+    await page.waitForTimeout(700);
+    const after = await page.evaluate(() => window.scrollY).catch(() => 0);
+    if (after === before && i > 2) break;
+  }
+  return (await loc.count()) > 0 ? loc.first() : null;
+}
+
+async function openSelling(page: Page): Promise<void> {
   await page.goto(SELLING_URL, { waitUntil: "domcontentloaded", timeout: 60000 });
   await page.waitForTimeout(4000);
+  await loadAllListings(page);
+}
+
+/** Read the seller's current listings from the "Selling" page (all of them, not just the first screenful). */
+export async function listMine(): Promise<{ text: string; screenshot: Buffer }> {
+  const page = await getPage();
+  await openSelling(page);
   const text = await page.innerText("body");
   const screenshot = await page.screenshot();
   return { text, screenshot };
@@ -521,22 +583,11 @@ export interface RenewResult {
  */
 export async function renewListing(title: string): Promise<RenewResult> {
   const page = await getPage();
-  await page.goto(SELLING_URL, { waitUntil: "domcontentloaded", timeout: 60000 });
-  await page.waitForTimeout(4000);
+  await openSelling(page);
 
-  const labels = ["Más opciones para", "More options for"].map((p) => `${p} ${title}`);
-  let menuBtn = null;
-  for (const l of labels) {
-    const loc = page.locator(`[role=button][aria-label="${l.replace(/"/g, '\\"')}"]`).filter({ visible: true });
-    if ((await loc.count()) > 0) {
-      menuBtn = loc.first();
-      break;
-    }
-  }
+  const menuBtn = await findMenuButton(page, title);
   if (!menuBtn) {
-    const titles = await page
-      .locator('[role=button][aria-label^="Más opciones para "], [role=button][aria-label^="More options for "]')
-      .evaluateAll((els) => [...new Set(els.map((e) => (e.getAttribute("aria-label") ?? "").replace(/^(Más opciones para|More options for) /, "")))]);
+    const titles = await menuTitles(page);
     return {
       status: "not_found",
       detail: `No listing titled exactly "${title}". Titles on the Selling page:\n- ${titles.join("\n- ")}`,
@@ -578,4 +629,43 @@ export async function renewListing(title: string): Promise<RenewResult> {
         detail: "Clicked 'Renovar publicación' but no confirmation appeared. Check the screenshot before retrying.",
         screenshot,
       };
+}
+
+export interface RenewalCheck {
+  title: string;
+  /** "available": "Renovar publicación" is in the menu right now. "wait": a countdown such as "Renovar (1 día)". "none": no renew item at all (sold, under review, too new). */
+  state: "available" | "wait" | "none";
+  wait?: string;
+}
+
+/**
+ * Report, for every listing on the Selling page, whether Facebook currently
+ * offers "Renovar publicación". READ-ONLY: it opens each "More options" menu,
+ * reads the items and closes it with Escape; it never clicks anything inside.
+ */
+export async function checkRenewals(): Promise<{ rows: RenewalCheck[]; screenshot: Buffer }> {
+  const page = await getPage();
+  await openSelling(page);
+  const titles = await menuTitles(page);
+  const rows: RenewalCheck[] = [];
+  for (const title of titles) {
+    const btn = await findMenuButton(page, title);
+    if (!btn) {
+      rows.push({ title, state: "none", wait: "menu not found" });
+      continue;
+    }
+    await btn.scrollIntoViewIfNeeded().catch(() => {});
+    await btn.click({ timeout: 10000 });
+    await page.waitForTimeout(1200);
+    const offered = (await page.locator("[role=menuitem]").allInnerTexts()).map((s) => s.trim());
+    await page.keyboard.press("Escape");
+    await page.waitForTimeout(400);
+    if (offered.some((s) => /^(Renovar publicación|Renew listing)$/.test(s))) {
+      rows.push({ title, state: "available" });
+    } else {
+      const w = offered.map((s) => s.match(/^(?:Renovar|Renew)\s*\(([^)]+)\)/i)).find(Boolean);
+      rows.push(w ? { title, state: "wait", wait: w[1].trim() } : { title, state: "none" });
+    }
+  }
+  return { rows, screenshot: await page.screenshot() };
 }

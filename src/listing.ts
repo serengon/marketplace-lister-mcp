@@ -97,8 +97,11 @@ async function clickButton(page: Page, names: readonly string[], timeout = 10000
  * Never `click({ force: true })`: that clicks by coordinates, and what is on
  * top is usually the chat, whose "Enviar un Me gusta" button would send a
  * like to a buyer.
+ *
+ * Without `once`, a normal click that fails is followed by a DOM click, which
+ * is fine for opening a menu but could click twice if the first one did land.
  */
-async function clickSafely(page: Page, loc: Locator, opts: { scroll?: boolean } = {}): Promise<void> {
+async function clickSafely(page: Page, loc: Locator, opts: { scroll?: boolean; once?: boolean } = {}): Promise<void> {
   if (opts.scroll !== false) {
     await loc
       .evaluate((el) => window.scrollBy(0, el.getBoundingClientRect().top - window.innerHeight * 0.25))
@@ -112,6 +115,12 @@ async function clickSafely(page: Page, loc: Locator, opts: { scroll?: boolean } 
       return !!hit && el.contains(hit);
     })
     .catch(() => false);
+  // `once`: for clicks that change something (renewing), pick the way to click
+  // up front and never follow a failed normal click with a second DOM click.
+  if (onTop && opts.once) {
+    await loc.click({ timeout: 3000 });
+    return;
+  }
   if (onTop) {
     try {
       await loc.click({ timeout: 3000 });
@@ -702,7 +711,7 @@ export async function renewListing(title: string): Promise<RenewResult> {
   }
 
   // The open menu can itself sit under the docked chat, hence the safe click.
-  await clickSafely(page, renew, { scroll: false });
+  await clickSafely(page, renew, { scroll: false, once: true });
   const toast = page.getByText(/Se renovó tu publicación|Your listing (was|has been) renewed/i).first();
   const ok = await toast
     .waitFor({ state: "visible", timeout: 10000 })
@@ -930,7 +939,9 @@ export async function editListing(input: EditInput): Promise<EditDraft> {
   if (description !== undefined && after.description.trim() !== description.trim()) problems.push("Description does not read back as written.");
   if ((await exactButton(page, UI.update).count()) === 0) problems.push("No Actualizar/Update button found on the form.");
 
-  pendingEdit = { listingId, ...after };
+  // A form with problems (e.g. a photo upload that did not finish, after the
+  // old photos were already removed) must not be savable.
+  pendingEdit = problems.length ? null : { listingId, ...after };
 
   // One shot from the top (photos, title, price, live preview on the right),
   // and one of the description when it changed, since it sits below the fold.
@@ -972,8 +983,19 @@ export async function saveListingEdit(): Promise<EditSaveResult> {
   if ((await save.count()) === 0) return lost("The Actualizar/Update button is not on the form.");
   await waitForUploads(page, 60000, UI.update);
 
-  pendingEdit = null; // one click only, whatever happens next
-  await clickSafely(page, save, { scroll: false });
+  // One click only, whatever happens next. A plain click with no fallback: the
+  // edit form has no chat dock, and if something (a Facebook dialog) covers
+  // Actualizar, saving underneath it is not what the seller approved.
+  pendingEdit = null;
+  try {
+    await save.click({ timeout: 10000 });
+  } catch (e) {
+    return {
+      status: "unconfirmed",
+      detail: `Could not click Actualizar (${String(e).split("\n")[0]}). It probably did not save; check the screenshot and list_my_listings before anything else.`,
+      screenshot: await page.screenshot(),
+    };
+  }
 
   const left = await page
     .waitForURL((u) => !u.toString().includes("/marketplace/edit"), { timeout: 30000 })

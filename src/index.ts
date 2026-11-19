@@ -258,11 +258,22 @@ server.tool(
     if (r.status === "not_found") {
       return { content: [text(`NOT FOUND: ${r.detail}`), ...r.screenshots.map(img)], isError: true };
     }
-    const problems = r.problems.length ? `\nPROBLEMS (tell the seller; do not save as is):\n- ${r.problems.join("\n- ")}` : "";
+    if (r.problems.length) {
+      return {
+        content: [
+          text(
+            `EDIT NOT READY (nothing saved, and save_listing_edit will refuse it): "${listing_title}" (listing ${r.listingId}).\n` +
+              `Problems:\n- ${r.problems.join("\n- ")}\nAttempted changes:\n- ${r.changes.join("\n- ")}\nTell the seller; retry edit_listing if appropriate.`
+          ),
+          ...r.screenshots.map(img),
+        ],
+        isError: true,
+      };
+    }
     return {
       content: [
         text(
-          `EDIT READY, NOT SAVED: "${listing_title}" (listing ${r.listingId}).\nChanges:\n- ${r.changes.join("\n- ")}${problems}\n` +
+          `EDIT READY, NOT SAVED: "${listing_title}" (listing ${r.listingId}).\nChanges:\n- ${r.changes.join("\n- ")}\n` +
             "Show the seller this screenshot and these changes, and call save_listing_edit only after their explicit OK."
         ),
         ...r.screenshots.map(img),

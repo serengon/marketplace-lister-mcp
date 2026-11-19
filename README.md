@@ -104,7 +104,7 @@ This is the fastest way to clear out a room: photograph, price, approve, next.
 ## What stays in your hands
 
 - **You set every price.** Claude never guesses one or quietly picks a number. It asks, every time. (If you want to see what similar things are going for first, ask, and it will look up local listings and show you the range. It won't tell you what to charge.)
-- **Nothing publishes without you.** Claude always stops at the preview and waits.
+- **Nothing publishes without you.** Claude always stops at the preview and waits. Edits to a live listing work the same way: Claude fills in the changes, shows you the edited form, and saves only when you say so.
 - **You sign into Facebook yourself.** Claude never asks for your password and can't accept one.
 
 ## Good to know
@@ -138,6 +138,8 @@ For the curious. You never call these by name; Claude picks them.
 | `publish_listing` | Publishes a listing left at the preview by `create_listing`. |
 | `list_my_listings` | Shows your current listings and whether they're live yet. |
 | `renew_listing` | Renews (bumps) one active listing by its exact title so it resurfaces in search. Says so when Facebook does not offer it yet. |
+| `edit_listing` | Changes an existing listing (found by its exact current title): new title, price, description and/or photos. Only what you ask for changes. `photos` replaces every photo in the order given, so the first one becomes the cover; to change just the cover, pass the same photos with the new cover first. Stops with a screenshot of the edited form **without saving**. |
+| `save_listing_edit` | Saves the edit left open by `edit_listing` (the form's **Actualizar** button) after you approve the screenshot, then checks the listing page shows the new title and price. Refuses if the form was closed or changed in between. |
 | `check_renewals` | Read-only: for every listing on the Selling page, says whether renewal is available now, in how long, or not at all. |
 | `list_inbox` | Read-only: lists the conversations in Messenger's Marketplace folder (buyer, listing, last message, time) with their thread ids. |
 | `read_thread` | Read-only: reads one Marketplace conversation by thread id, oldest message first, with a screenshot. |

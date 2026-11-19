@@ -1,10 +1,17 @@
 import fs from "node:fs";
 import path from "node:path";
-import type { Page } from "playwright";
+import type { Locator, Page } from "playwright";
 import { getPage } from "./browser.js";
 
 const CREATE_URL = "https://www.facebook.com/marketplace/create/item";
 const SELLING_URL = "https://www.facebook.com/marketplace/you/selling";
+const EDIT_URL = "https://www.facebook.com/marketplace/edit/?listing_id=";
+const ITEM_URL = "https://www.facebook.com/marketplace/item/";
+
+/** The photo picker on the create and edit forms (a second file input takes video). */
+const PHOTO_INPUT = 'input[type=file][accept*="image"]';
+/** Facebook's limit, stated on the form: "Puedes agregar un máximo de 10 fotos". */
+const MAX_PHOTOS = 10;
 
 const IMAGE_EXT = new Set([".jpg", ".jpeg", ".png", ".webp", ".gif"]);
 
@@ -21,6 +28,8 @@ const UI = {
   moreDetails: ["More details", "Más detalles"],
   next: ["Next", "Siguiente"],
   publish: ["Publish", "Publicar"],
+  /** Save button of the edit form; on es-AR it is a div[role=button] labelled "Actualizar". */
+  update: ["Actualizar", "Update", "Guardar", "Save"],
 } as const;
 
 /** Each condition as Facebook names it in English and in Spanish. */
@@ -72,6 +81,46 @@ async function clickButton(page: Page, names: readonly string[], timeout = 10000
     if (Date.now() > deadline) return false;
     await page.waitForTimeout(500);
   }
+}
+
+/**
+ * Click `loc` even when something floats over it.
+ *
+ * On the Selling page the docked Messenger chat (x 846-1184, y >= 402 in a
+ * 1279x857 window) and the fixed top banner (y < 56) sit on top of the
+ * listing menus, so Playwright's click kept retrying until it timed out
+ * ("<div data-visualcompletion=ignore> intercepts pointer events"). First move
+ * the element to a quarter of the way down the window, clear of both, and
+ * click normally if it really is the topmost thing there. Otherwise click the
+ * element itself through the DOM.
+ *
+ * Never `click({ force: true })`: that clicks by coordinates, and what is on
+ * top is usually the chat, whose "Enviar un Me gusta" button would send a
+ * like to a buyer.
+ */
+async function clickSafely(page: Page, loc: Locator, opts: { scroll?: boolean } = {}): Promise<void> {
+  if (opts.scroll !== false) {
+    await loc
+      .evaluate((el) => window.scrollBy(0, el.getBoundingClientRect().top - window.innerHeight * 0.25))
+      .catch(() => {});
+    await page.waitForTimeout(400);
+  }
+  const onTop = await loc
+    .evaluate((el) => {
+      const r = el.getBoundingClientRect();
+      const hit = document.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2);
+      return !!hit && el.contains(hit);
+    })
+    .catch(() => false);
+  if (onTop) {
+    try {
+      await loc.click({ timeout: 3000 });
+      return;
+    } catch {
+      /* covered after all: click it through the DOM instead */
+    }
+  }
+  await loc.evaluate((el) => (el as HTMLElement).click());
 }
 
 /** "15000", "15.000", "$ 15.000" all match a price of 15000 regardless of separators. */
@@ -361,8 +410,7 @@ export async function fillListing(input: ListingInput): Promise<FilledDraft> {
   await gotoCreate(page);
   await page.waitForTimeout(2500);
 
-  const fileInput = 'input[type=file][accept*="image"]';
-  await page.setInputFiles(fileInput, input.photos, { timeout: 20000 });
+  await page.setInputFiles(PHOTO_INPUT, input.photos, { timeout: 20000 });
   await page.waitForTimeout(3500);
 
   await (await labelled(page, UI.title, "input")).fill(input.title);
@@ -396,11 +444,15 @@ export async function fillListing(input: ListingInput): Promise<FilledDraft> {
   return { screenshot: await page.screenshot(), filled, problems };
 }
 
-/** Wait (bounded) until Next is enabled, which is how the form signals the photos finished uploading. */
-async function waitForUploads(page: Page, timeout = 60000): Promise<void> {
+/**
+ * Wait (bounded) until the form's main button is enabled, which is how it
+ * signals the photos finished uploading: Next on the create form, Actualizar
+ * on the edit form (disabled for the ~2 s an upload takes).
+ */
+async function waitForUploads(page: Page, timeout = 60000, button: readonly string[] = UI.next): Promise<void> {
   const deadline = Date.now() + timeout;
   while (Date.now() < deadline) {
-    const next = exactButton(page, UI.next);
+    const next = exactButton(page, button);
     if ((await next.count()) > 0 && (await next.getAttribute("aria-disabled")) !== "true") return;
     await page.waitForTimeout(1000);
   }
@@ -537,8 +589,14 @@ async function findMenuButton(page: Page, title: string) {
     .join(", ");
   const loc = page.locator(sel);
   const vp = page.viewportSize() ?? { width: 1280, height: 860 };
+  // Each card renders the button twice; one copy is a 0x0 duplicate, so prefer
+  // the visible one or the click lands on nothing.
+  const pick = async () => {
+    const vis = loc.filter({ visible: true });
+    return (await vis.count()) > 0 ? vis.first() : loc.first();
+  };
   for (let i = 0; i < 25; i++) {
-    if ((await loc.count()) > 0) return loc.first();
+    if ((await loc.count()) > 0) return pick();
     const before = await page.evaluate(() => window.scrollY).catch(() => 0);
     await page.mouse.move(vp.width * 0.6, vp.height * 0.6);
     await page.mouse.wheel(0, 700);
@@ -546,7 +604,35 @@ async function findMenuButton(page: Page, title: string) {
     const after = await page.evaluate(() => window.scrollY).catch(() => 0);
     if (after === before && i > 2) break;
   }
-  return (await loc.count()) > 0 ? loc.first() : null;
+  return (await loc.count()) > 0 ? pick() : null;
+}
+
+/**
+ * Items of the menu that is open right now. Closed menus leave their items in
+ * the DOM, hidden (0x0), so without the visibility filter a later lookup can
+ * read, or click, an item of a previous listing's menu.
+ */
+function menuItems(page: Page): Locator {
+  return page.locator("[role=menuitem]").filter({ visible: true });
+}
+
+/**
+ * Open a listing's "More options" menu and wait for its items. Returns false
+ * if no menu appeared. Shared by renew, check and edit.
+ */
+async function openMenu(page: Page, btn: Locator): Promise<boolean> {
+  await clickSafely(page, btn);
+  return menuItems(page)
+    .first()
+    .waitFor({ state: "visible", timeout: 6000 })
+    .then(() => true)
+    .catch(() => false);
+}
+
+/** Close an open "More options" menu without touching any of its items. */
+async function closeMenu(page: Page): Promise<void> {
+  await page.keyboard.press("Escape").catch(() => {});
+  await page.waitForTimeout(400);
 }
 
 async function openSelling(page: Page): Promise<void> {
@@ -595,13 +681,13 @@ export async function renewListing(title: string): Promise<RenewResult> {
     };
   }
 
-  await menuBtn.scrollIntoViewIfNeeded();
-  await menuBtn.click({ timeout: 10000 });
-  await page.waitForTimeout(1500);
+  if (!(await openMenu(page, menuBtn))) {
+    throw new Error(`The "More options" menu of "${title}" did not open. Nothing was clicked inside it; try again.`);
+  }
 
-  const renew = page.locator("[role=menuitem]").filter({ hasText: /^\s*(Renovar publicación|Renew listing)\s*$/ }).first();
+  const renew = menuItems(page).filter({ hasText: /^\s*(Renovar publicación|Renew listing)\s*$/ }).first();
   if ((await renew.count()) === 0) {
-    const offered = await page.locator("[role=menuitem]").allInnerTexts();
+    const offered = await menuItems(page).allInnerTexts();
     // Right after a renewal the item reads "Renovar (7 días)": a countdown, not an action.
     const wait = offered.map((s) => s.match(/^\s*(?:Renovar|Renew)\s*\(([^)]+)\)/i)).find(Boolean);
     const screenshot = await page.screenshot();
@@ -615,7 +701,8 @@ export async function renewListing(title: string): Promise<RenewResult> {
     };
   }
 
-  await renew.click({ timeout: 10000 });
+  // The open menu can itself sit under the docked chat, hence the safe click.
+  await clickSafely(page, renew, { scroll: false });
   const toast = page.getByText(/Se renovó tu publicación|Your listing (was|has been) renewed/i).first();
   const ok = await toast
     .waitFor({ state: "visible", timeout: 10000 })
@@ -654,12 +741,13 @@ export async function checkRenewals(): Promise<{ rows: RenewalCheck[]; screensho
       rows.push({ title, state: "none", wait: "menu not found" });
       continue;
     }
-    await btn.scrollIntoViewIfNeeded().catch(() => {});
-    await btn.click({ timeout: 10000 });
-    await page.waitForTimeout(1200);
-    const offered = (await page.locator("[role=menuitem]").allInnerTexts()).map((s) => s.trim());
-    await page.keyboard.press("Escape");
-    await page.waitForTimeout(400);
+    if (!(await openMenu(page, btn))) {
+      rows.push({ title, state: "none", wait: "menu did not open" });
+      await closeMenu(page);
+      continue;
+    }
+    const offered = (await menuItems(page).allInnerTexts()).map((s) => s.trim());
+    await closeMenu(page);
     if (offered.some((s) => /^(Renovar publicación|Renew listing)$/.test(s))) {
       rows.push({ title, state: "available" });
     } else {
@@ -668,4 +756,251 @@ export async function checkRenewals(): Promise<{ rows: RenewalCheck[]; screensho
     }
   }
   return { rows, screenshot: await page.screenshot() };
+}
+
+export interface EditInput {
+  /** The listing's current title, exactly as the Selling page shows it. */
+  listingTitle: string;
+  title?: string;
+  price?: string | number;
+  description?: string;
+  /** Replaces EVERY photo, in this order; the first becomes the cover. */
+  photos?: string[];
+}
+
+export interface EditDraft {
+  status: "ready" | "not_found";
+  listingId?: string;
+  /** "Field: old → new" for each change applied to the form. */
+  changes: string[];
+  /** Changes that did not take, read back from the form. */
+  problems: string[];
+  detail?: string;
+  screenshots: Buffer[];
+}
+
+export interface EditSaveResult {
+  status: "saved" | "unconfirmed" | "lost";
+  detail: string;
+  screenshot: Buffer;
+}
+
+/**
+ * What edit_listing left on screen, so save_listing_edit can check the form is
+ * still the one the seller approved. Every tool shares one browser tab, so
+ * anything that ran in between (the auto-reply loop reading the inbox, say)
+ * may have navigated away and dropped the edit.
+ */
+let pendingEdit: { listingId: string; title: string; price: string; photoCount: number; description: string } | null = null;
+
+const REMOVE_PHOTO = '[role=button][aria-label^="Eliminar foto "], [role=button][aria-label^="Remove photo "]';
+const REMOVE_FIRST_PHOTO = '[role=button][aria-label^="Eliminar foto 1 de "], [role=button][aria-label^="Remove photo 1 of "]';
+
+/** Current values of the edit form's fields, as the seller would see them. */
+async function readEditForm(page: Page) {
+  const val = async (names: readonly string[], tag: string) =>
+    (await labelled(page, names, tag, 1500).catch(() => null))?.inputValue().catch(() => "") ?? "";
+  return {
+    title: await val(UI.title, "input"),
+    price: await val(UI.price, "input"),
+    description: await val(UI.description, "textarea"),
+    photoCount: await page.locator(REMOVE_PHOTO).count(),
+  };
+}
+
+/**
+ * The listing's id, read from the href of "Editar publicación" (or "Ver
+ * publicación") in its "More options" menu. Reading the href instead of
+ * clicking the item matters: with the menu open, its lower items sit under the
+ * docked Messenger chat, and a stray click there could hit "Eliminar
+ * publicación" or the chat itself.
+ */
+async function listingIdFromMenu(page: Page, btn: Locator): Promise<string | null> {
+  if (!(await openMenu(page, btn))) return null;
+  const hrefs = await menuItems(page).evaluateAll((els) =>
+    els.map((e) => e.getAttribute("href") ?? e.querySelector("a")?.getAttribute("href") ?? "")
+  );
+  await closeMenu(page);
+  for (const h of hrefs) {
+    const m = h.match(/listing_id=(\d{6,})/) ?? h.match(/\/marketplace\/item\/(\d{6,})/);
+    if (m) return m[1];
+  }
+  return null;
+}
+
+/** Scroll the form pane so `loc` is visible, then screenshot the whole window. */
+async function shotAt(page: Page, loc: Locator | null, block: "start" | "center" = "center"): Promise<Buffer> {
+  if (loc) await loc.evaluate((el, b) => el.scrollIntoView({ block: b }), block).catch(() => {});
+  await page.waitForTimeout(600);
+  return page.screenshot();
+}
+
+/**
+ * Open the edit form of one listing, apply only the requested changes and STOP
+ * there, unsaved, returning screenshots for the seller to approve. Saving is
+ * saveListingEdit(), after that approval.
+ *
+ * Photos: the form has no reorder control, so `photos` replaces them all.
+ * Every current photo is removed ("Eliminar foto 1 de N", repeatedly) and the
+ * new set uploaded in order, which makes the first one the cover. Nothing of
+ * this reaches Facebook until "Actualizar" is clicked: a removed photo is back
+ * when the form is reopened without saving.
+ */
+export async function editListing(input: EditInput): Promise<EditDraft> {
+  const { listingTitle, title, price, description, photos } = input;
+  if (title === undefined && price === undefined && description === undefined && !photos?.length) {
+    throw new Error("Nothing to change: pass at least one of title, price, description or photos.");
+  }
+  if (photos?.length) {
+    if (photos.length > MAX_PHOTOS) throw new Error(`Facebook allows at most ${MAX_PHOTOS} photos; got ${photos.length}.`);
+    for (const p of photos) if (!fs.existsSync(p)) throw new Error(`Photo not found: ${p}`);
+  }
+  pendingEdit = null;
+
+  const page = await getPage();
+  await openSelling(page);
+  const btn = await findMenuButton(page, listingTitle);
+  if (!btn) {
+    const titles = await menuTitles(page);
+    return {
+      status: "not_found",
+      changes: [],
+      problems: [],
+      detail: `No listing titled exactly "${listingTitle}". Titles on the Selling page:\n- ${titles.join("\n- ")}`,
+      screenshots: [await page.screenshot()],
+    };
+  }
+  const listingId = await listingIdFromMenu(page, btn);
+  if (!listingId) throw new Error(`Could not read the listing id of "${listingTitle}" from its "More options" menu.`);
+
+  await page.goto(EDIT_URL + listingId, { waitUntil: "domcontentloaded", timeout: 60000 });
+  const titleInput = await labelled(page, UI.title, "input", 30000).catch(() => null);
+  if (!titleInput || !page.url().includes("/marketplace/edit")) {
+    throw new Error(`The edit form for listing ${listingId} did not open (now at ${page.url()}).`);
+  }
+  await waitForUploads(page, 15000, UI.update);
+  const before = await readEditForm(page);
+  if (before.title.trim() !== listingTitle.trim()) {
+    throw new Error(`Opened listing ${listingId} but its form shows the title "${before.title}", not "${listingTitle}". Nothing was changed.`);
+  }
+
+  const changes: string[] = [];
+  const problems: string[] = [];
+
+  if (photos?.length) {
+    // Bounded by the photos that were there, and only ever on the edit form.
+    for (let i = 0; i < before.photoCount; i++) {
+      if (!page.url().includes("/marketplace/edit")) throw new Error(`Left the edit form while removing photos (now at ${page.url()}).`);
+      const first = page.locator(REMOVE_FIRST_PHOTO).first();
+      if ((await first.count()) === 0) break;
+      const n = await page.locator(REMOVE_PHOTO).count();
+      await clickSafely(page, first, { scroll: false });
+      const deadline = Date.now() + 5000;
+      while ((await page.locator(REMOVE_PHOTO).count()) >= n && Date.now() < deadline) await page.waitForTimeout(250);
+    }
+    await page.setInputFiles(PHOTO_INPUT, photos, { timeout: 20000 });
+    await page.waitForTimeout(1000);
+    await waitForUploads(page, 90000, UI.update);
+    const deadline = Date.now() + 20000;
+    while ((await page.locator(REMOVE_PHOTO).count()) !== photos.length && Date.now() < deadline) await page.waitForTimeout(500);
+    const got = await page.locator(REMOVE_PHOTO).count();
+    changes.push(`Fotos: ${before.photoCount} → ${photos.length}, portada ${path.basename(photos[0])} (${photos.map((p) => path.basename(p)).join(", ")})`);
+    if (got !== photos.length) problems.push(`The form shows ${got} photos, expected ${photos.length}.`);
+  }
+
+  if (title !== undefined) {
+    await (await labelled(page, UI.title, "input")).fill(title);
+    changes.push(`Título: "${before.title}" → "${title}"`);
+  }
+  if (price !== undefined) {
+    await (await labelled(page, UI.price, "input")).fill(String(price).replace(/[^\d]/g, ""));
+    changes.push(`Precio: ${before.price} → ${price}`);
+  }
+  if (description !== undefined) {
+    if (!(await labelled(page, UI.description, "textarea", 1500).catch(() => null))) await clickButton(page, UI.moreDetails, 5000);
+    await (await labelled(page, UI.description, "textarea")).fill(description);
+    changes.push(`Descripción: reemplazada (${before.description.length} → ${description.length} caracteres)`);
+  }
+  await page.waitForTimeout(800);
+  await waitForUploads(page, 30000, UI.update);
+
+  const after = await readEditForm(page);
+  if (title !== undefined && after.title !== title) problems.push(`Title reads "${after.title}" after filling.`);
+  if (price !== undefined && !priceAppears(after.price, price)) problems.push(`Price reads "${after.price}" after filling.`);
+  if (description !== undefined && after.description.trim() !== description.trim()) problems.push("Description does not read back as written.");
+  if ((await exactButton(page, UI.update).count()) === 0) problems.push("No Actualizar/Update button found on the form.");
+
+  pendingEdit = { listingId, ...after };
+
+  // One shot from the top (photos, title, price, live preview on the right),
+  // and one of the description when it changed, since it sits below the fold.
+  const top = page.locator(REMOVE_PHOTO).first();
+  const screenshots = [await shotAt(page, top, "start")];
+  if (description !== undefined) {
+    screenshots.push(await shotAt(page, await labelled(page, UI.description, "textarea", 1500).catch(() => null)));
+    await shotAt(page, top, "start");
+  }
+  return { status: "ready", listingId, changes, problems, screenshots };
+}
+
+/**
+ * Click "Actualizar" on the form editListing() left open, then reopen the
+ * listing to confirm. Refuses unless the form is still the one that was
+ * prepared: same listing id in the URL, same title, price, description and
+ * photo count. Never retries.
+ */
+export async function saveListingEdit(): Promise<EditSaveResult> {
+  const page = await getPage();
+  const lost = async (why: string): Promise<EditSaveResult> => ({
+    status: "lost",
+    detail: `${why} Nothing was saved. Run edit_listing again and get the seller's OK on the new screenshot.`,
+    screenshot: await page.screenshot(),
+  });
+  const pending = pendingEdit;
+  if (!pending) return lost("No edit is waiting to be saved.");
+  if (!page.url().includes("/marketplace/edit") || !page.url().includes(`listing_id=${pending.listingId}`)) {
+    pendingEdit = null;
+    return lost(`The edit form is no longer open (now at ${page.url()}).`);
+  }
+  const now = await readEditForm(page);
+  const drift = (["title", "price", "description", "photoCount"] as const).filter((k) => now[k] !== pending[k]);
+  if (drift.length) {
+    pendingEdit = null;
+    return lost(`The open form no longer matches what edit_listing prepared (${drift.join(", ")} differ).`);
+  }
+  const save = exactButton(page, UI.update);
+  if ((await save.count()) === 0) return lost("The Actualizar/Update button is not on the form.");
+  await waitForUploads(page, 60000, UI.update);
+
+  pendingEdit = null; // one click only, whatever happens next
+  await clickSafely(page, save, { scroll: false });
+
+  const left = await page
+    .waitForURL((u) => !u.toString().includes("/marketplace/edit"), { timeout: 30000 })
+    .then(() => true)
+    .catch(() => false);
+  if (!left) {
+    return {
+      status: "unconfirmed",
+      detail: "Clicked Actualizar but the edit form is still open (an error on the form, or still saving). Check the screenshot; do not click again without the seller.",
+      screenshot: await page.screenshot(),
+    };
+  }
+
+  await page.waitForTimeout(3000);
+  await page.goto(ITEM_URL + pending.listingId + "/", { waitUntil: "domcontentloaded", timeout: 60000 }).catch(() => {});
+  await page.waitForTimeout(5000);
+  const body = await page.innerText("body").catch(() => "");
+  const titleOk = body.includes(pending.title.slice(0, 40));
+  const priceOk = priceAppears(body, pending.price);
+  const screenshot = await page.screenshot();
+  return titleOk && priceOk
+    ? { status: "saved", detail: `Saved. The listing page (${ITEM_URL}${pending.listingId}/) shows "${pending.title}" at ${pending.price}.`, screenshot }
+    : {
+        status: "unconfirmed",
+        detail:
+          `Clicked Actualizar and the form closed, but the listing page does not show the new ${[titleOk ? "" : "title", priceOk ? "" : "price"].filter(Boolean).join(" and ")} yet ` +
+          "(Facebook may still be reviewing the change). Check list_my_listings before doing anything else.",
+        screenshot,
+      };
 }

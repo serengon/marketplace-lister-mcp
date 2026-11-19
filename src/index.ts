@@ -4,7 +4,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import { smoothLogin } from "./login.js";
 import { isLoggedIn, profileDir, closeContext } from "./browser.js";
-import { scanItems, fillListing, publishListing, postListing, listMine, photosInFolder, renewListing, checkRenewals } from "./listing.js";
+import { scanItems, fillListing, publishListing, postListing, listMine, photosInFolder, renewListing, checkRenewals, editListing, saveListingEdit } from "./listing.js";
 import { searchComps } from "./comps.js";
 import { listInbox, readThread, sendMessage, listChats } from "./messages.js";
 
@@ -231,6 +231,55 @@ server.tool(
     const line = (r: { title: string; state: string; wait?: string }) =>
       `${r.state === "available" ? "AVAILABLE" : r.state === "wait" ? `WAIT ${r.wait}` : `NONE${r.wait ? ` (${r.wait})` : ""}`}: ${r.title}`;
     return { content: [text(rows.length ? rows.map(line).join("\n") : "No listings found on the Selling page."), img(screenshot)] };
+  }
+);
+
+server.tool(
+  "edit_listing",
+  "Edit ONE existing listing, step 1 of 2. Opens that listing's edit form (matched by its exact current title, as list_my_listings shows it), applies ONLY the fields you pass and STOPS without saving, returning the list of changes plus a screenshot of the edited form with Facebook's live preview (and one of the description when it changed). Fields you leave out stay as they are. Nothing changes on Facebook yet. Before calling, tell the seller what you will change. Afterwards show them the screenshot and the change list and WAIT for their explicit OK; only then call save_listing_edit. If they want something different, call edit_listing again; to drop the edit, just don't save. Any new title, price or description must be the seller's own (a price is never estimated). `photos` REPLACES ALL current photos, in the order given, and the first becomes the cover; to only change the cover, pass every photo you want kept with the new cover first (they are usually still in the folder the item was listed from).",
+  {
+    listing_title: z.string().min(1).describe("The listing's CURRENT title exactly as list_my_listings shows it."),
+    title: z.string().min(1).optional().describe("New title."),
+    price: z
+      .union([z.string(), z.number()])
+      .optional()
+      .describe("New price, the seller's own number. Ask for it; never infer, estimate or derive it from comps."),
+    description: z.string().min(1).optional().describe("New description; replaces the whole current text."),
+    photos: z
+      .array(z.string())
+      .min(1)
+      .max(10)
+      .optional()
+      .describe("Absolute paths of the new photo set (max 10). Replaces every current photo; the first is the cover."),
+  },
+  async ({ listing_title, title, price, description, photos }) => {
+    if (!(await isLoggedIn())) return { content: [text("Not logged in. Call fb_login first.")], isError: true };
+    const r = await editListing({ listingTitle: listing_title, title, price, description, photos });
+    if (r.status === "not_found") {
+      return { content: [text(`NOT FOUND: ${r.detail}`), ...r.screenshots.map(img)], isError: true };
+    }
+    const problems = r.problems.length ? `\nPROBLEMS (tell the seller; do not save as is):\n- ${r.problems.join("\n- ")}` : "";
+    return {
+      content: [
+        text(
+          `EDIT READY, NOT SAVED: "${listing_title}" (listing ${r.listingId}).\nChanges:\n- ${r.changes.join("\n- ")}${problems}\n` +
+            "Show the seller this screenshot and these changes, and call save_listing_edit only after their explicit OK."
+        ),
+        ...r.screenshots.map(img),
+      ],
+    };
+  }
+);
+
+server.tool(
+  "save_listing_edit",
+  "Edit a listing, step 2 of 2: clicks 'Actualizar' (Update) on the form edit_listing left open, then reopens the listing to confirm the new title and price show. Call ONLY after the seller has seen the edit_listing screenshot and explicitly approved those exact changes; approval for one edit never covers another listing or a later edit. It refuses ('lost') if the form is no longer open or differs from what edit_listing prepared (e.g. another tool navigated the browser in between): run edit_listing again and get a fresh OK. Never retries: on 'unconfirmed', check list_my_listings before doing anything else. Facebook may show an edited listing as under review for a few minutes.",
+  {},
+  async () => {
+    if (!(await isLoggedIn())) return { content: [text("Not logged in. Call fb_login first.")], isError: true };
+    const r = await saveListingEdit();
+    const head = { saved: "SAVED", unconfirmed: "UNCONFIRMED", lost: "NOT SAVED" }[r.status];
+    return { content: [text(`${head}: ${r.detail}`), img(r.screenshot)], isError: r.status !== "saved" };
   }
 );
 

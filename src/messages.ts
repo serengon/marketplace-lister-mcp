@@ -2,7 +2,8 @@ import type { Page } from "playwright";
 import { getContext } from "./browser.js";
 
 /**
- * Marketplace conversations: list them, read one, send one reply.
+ * Marketplace conversations: list them, read one, send one reply. Personal
+ * (non-Marketplace) chats can be listed and read too, never sent to.
  *
  * Every conversation has a unique Messenger thread id (the number in
  * facebook.com/messages/t/<id>). list_inbox returns it, and read/send open the
@@ -16,6 +17,8 @@ import { getContext } from "./browser.js";
 
 const MESSAGES_URL = "https://www.facebook.com/messages/t/";
 const ID_RE = /^\d{5,25}$/;
+/** Thread links are /messages/t/<id>/ or, for end-to-end encrypted chats, /messages/e2ee/t/<id>/. */
+const LINK_ID_RE = /\/messages\/(?:e2ee\/)?t\/(\d+)/;
 
 async function withTab<T>(fn: (page: Page) => Promise<T>): Promise<T> {
   const ctx = await getContext();
@@ -36,26 +39,34 @@ export interface InboxRow {
 }
 
 const WHEN_RE =
-  /^(\d{1,2}:\d{2}\s*(am|pm)?|Lun|Mar|Mié|Jue|Vie|Sáb|Dom|Mon|Tue|Wed|Thu|Fri|Sat|Sun|\d+\s*(min|h|d|días?|sem|w)|\d{1,2}\/\d{1,2}(\/\d{2,4})?)$/i;
+  /^(\d{1,2}:\d{2}\s*(am|pm)?|Lun|Mar|Mié|Jue|Vie|Sáb|Dom|Mon|Tue|Wed|Thu|Fri|Sat|Sun|\d+\s*(min|h|d|días?|sem|w|a|años?|y)|\d{1,2}\/\d{1,2}(\/\d{2,4})?)$/i;
 
 /** Open Messenger's "Marketplace" folder, which lists every buyer thread. */
 async function openMarketplaceFolder(page: Page): Promise<void> {
   await page.goto(MESSAGES_URL, { waitUntil: "domcontentloaded", timeout: 60000 });
   await page.waitForTimeout(6000);
-  const folder = page.locator("[role=row]").filter({ hasText: /^\s*Marketplace/ }) // text runs together: "Marketplace6 mensajes nuevos".first();
+  // Text runs together: "Marketplace6 mensajes nuevos".
+  const folder = page.locator("[role=row]").filter({ hasText: /^\s*Marketplace/ }).first();
   if ((await folder.count()) === 0) throw new Error(`Marketplace folder not found in Messenger at ${page.url()}`);
   await folder.click({ timeout: 10000 });
   await page.waitForTimeout(4000);
 }
 
-function parseRow(href: string, raw: string): InboxRow | null {
-  const id = href.match(/\/messages\/t\/(\d+)/)?.[1];
+/** A chat-list link split into its thread id and non-empty text lines. */
+function rowLines(href: string, raw: string): { id: string; lines: string[] } | null {
+  const id = href.match(LINK_ID_RE)?.[1];
   if (!id) return null;
   const lines = raw
     .split("\n")
     .map((s) => s.trim())
     .filter((s) => s.length > 0 && s !== "·");
-  if (lines.length === 0) return null;
+  return lines.length ? { id, lines } : null;
+}
+
+function parseRow(href: string, raw: string): InboxRow | null {
+  const r = rowLines(href, raw);
+  if (!r) return null;
+  const { id, lines } = r;
   const sep = lines[0].indexOf(" · ");
   if (sep < 1) return null; // not a "Buyer · Listing" Marketplace thread
   const rest = lines.slice(1);
@@ -70,16 +81,16 @@ function parseRow(href: string, raw: string): InboxRow | null {
   };
 }
 
-async function readRows(page: Page): Promise<InboxRow[]> {
+async function readRows<T extends { id: string }>(page: Page, parse: (href: string, raw: string) => T | null): Promise<T[]> {
   const raws: [string, string][] = await page.evaluate(() =>
-    [...document.querySelectorAll("a[href*='/messages/t/']")].map(
+    [...document.querySelectorAll("a[href*='/messages/t/'], a[href*='/messages/e2ee/t/']")].map(
       (a) => [a.getAttribute("href") || "", (a as HTMLElement).innerText || ""] as [string, string]
     )
   );
   const seen = new Set<string>();
-  const rows: InboxRow[] = [];
+  const rows: T[] = [];
   for (const [href, raw] of raws) {
-    const row = parseRow(href, raw);
+    const row = parse(href, raw);
     if (!row || seen.has(row.id)) continue;
     seen.add(row.id);
     rows.push(row);
@@ -88,10 +99,14 @@ async function readRows(page: Page): Promise<InboxRow[]> {
 }
 
 /** Scroll the chat list so older threads load, collecting rows as they render. */
-async function collect(page: Page, scrolls: number): Promise<InboxRow[]> {
-  const byId = new Map<string, InboxRow>();
+async function collect<T extends { id: string }>(
+  page: Page,
+  scrolls: number,
+  parse: (href: string, raw: string) => T | null
+): Promise<T[]> {
+  const byId = new Map<string, T>();
   for (let i = 0; i <= scrolls; i++) {
-    for (const r of await readRows(page)) if (!byId.has(r.id)) byId.set(r.id, r);
+    for (const r of await readRows(page, parse)) if (!byId.has(r.id)) byId.set(r.id, r);
     if (i === scrolls) break;
     await page.mouse.move(180, 700);
     await page.mouse.wheel(0, 1500);
@@ -103,33 +118,85 @@ async function collect(page: Page, scrolls: number): Promise<InboxRow[]> {
 export async function listInbox(scrolls = 3): Promise<InboxRow[]> {
   return withTab(async (page) => {
     await openMarketplaceFolder(page);
-    return collect(page, scrolls);
+    return collect(page, scrolls, parseRow);
+  });
+}
+
+export interface ChatRow {
+  id: string;
+  name: string;
+  preview: string;
+  when: string;
+  unread: boolean;
+}
+
+/** Screen-reader line Messenger puts before the preview of an unread chat: "Mensaje no leído:". */
+const UNREAD_RE = /^((\d+\s+)?mensajes? no leídos?|(\d+\s+)?unread messages?)\s*:?$/i;
+
+/**
+ * A row of the main "Chats" list: name, optional unread marker, preview, time.
+ * The aggregated "Marketplace" row has no thread link, so it never gets here;
+ * "Buyer · Listing" rows are Marketplace threads and belong to list_inbox.
+ */
+export function parseChatRow(href: string, raw: string): ChatRow | null {
+  const r = rowLines(href, raw);
+  if (!r) return null;
+  const { id, lines } = r;
+  const name = lines[0];
+  if (name.includes(" · ")) return null;
+  let rest = lines.slice(1);
+  const unread = rest.some((l) => UNREAD_RE.test(l));
+  rest = rest.filter((l) => !UNREAD_RE.test(l));
+  let when = "";
+  if (rest.length && WHEN_RE.test(rest[rest.length - 1])) when = rest.pop()!;
+  return {
+    id,
+    name,
+    preview: rest.join(" ").replace(/\s*·\s*$/, "").slice(0, 200),
+    when,
+    unread,
+  };
+}
+
+/** Personal chats from Messenger's main "Chats" list (not the Marketplace folder), newest first. */
+export async function listChats(scrolls = 3): Promise<ChatRow[]> {
+  return withTab(async (page) => {
+    await page.goto(MESSAGES_URL, { waitUntil: "domcontentloaded", timeout: 60000 });
+    await page.waitForTimeout(6000);
+    return collect(page, scrolls, parseChatRow);
   });
 }
 
 /** "Escribe en <buyer> · <listing>" / "Write to <buyer> · <listing>" */
 const COMPOSER_LABEL = /^(?:Escribe en|Write to|Message)\s+(.+?)\s+·\s+(.+)$/;
+/** Personal chats: "Escribe en <name>", no listing. */
+const PERSONAL_COMPOSER_LABEL = /^(?:Escribe en|Write to|Message)\s+(.+)$/;
+/** Label of the message list: "Mensajes de la conversación con <name>". */
+const CONVERSATION_LABEL = /^(?:Mensajes de la conversación con|Messages in conversation with)\s+(.+)$/;
 
 function composer(page: Page) {
   return page.locator("[contenteditable=true][role=textbox]").filter({ visible: true }).first();
 }
 
-/** Open the thread by id and name it from its composer label. */
+/**
+ * Open the thread by id and name it from its composer label. Marketplace
+ * threads get buyer + listing; personal chats get the person's name as
+ * `buyer` and an empty `listing`.
+ */
 async function openThread(page: Page, id: string): Promise<{ row: InboxRow; canWrite: boolean }> {
-  if (!ID_RE.test(id)) throw new Error(`"${id}" is not a thread id. Use the id from list_inbox.`);
+  if (!ID_RE.test(id)) throw new Error(`"${id}" is not a thread id. Use the id from list_inbox or list_chats.`);
   await page.goto(`${MESSAGES_URL}${id}/`, { waitUntil: "domcontentloaded", timeout: 60000 });
   await page.waitForTimeout(6000);
-  if (!page.url().includes(`/messages/t/${id}`)) {
+  if (page.url().match(LINK_ID_RE)?.[1] !== id) {
     throw new Error(`Thread ${id} did not open (landed on ${page.url()}). It may have been deleted.`);
   }
   const box = composer(page);
   const canWrite = (await box.count()) > 0;
   let buyer = "";
   let listing = "";
-  if (canWrite) {
-    const m = ((await box.getAttribute("aria-label")) || "").match(COMPOSER_LABEL);
-    if (m) [, buyer, listing] = m;
-  }
+  const boxLabel = canWrite ? (await box.getAttribute("aria-label")) || "" : "";
+  const m = boxLabel.match(COMPOSER_LABEL);
+  if (m) [, buyer, listing] = m;
   if (!buyer) {
     // Left or read-only threads have no composer: fall back to the page header.
     const head = await page.evaluate(() => {
@@ -143,6 +210,15 @@ async function openThread(page: Page, id: string): Promise<{ row: InboxRow; canW
       buyer = head.slice(0, sep).trim();
       listing = head.slice(sep + 3).trim();
     }
+  }
+  if (!buyer) {
+    // Personal chat: "Escribe en <name>", or the message list's own label.
+    const conv = await page.evaluate(() =>
+      [...document.querySelectorAll("[role=main] [aria-label]")]
+        .map((e) => e.getAttribute("aria-label") || "")
+        .find((a) => /^(Mensajes de la conversación con|Messages in conversation with)\s/.test(a)) || ""
+    );
+    buyer = (boxLabel.match(PERSONAL_COMPOSER_LABEL)?.[1] || conv.match(CONVERSATION_LABEL)?.[1] || "").trim();
   }
   return { row: { id, buyer, listing, preview: "", when: "" }, canWrite };
 }
@@ -213,6 +289,8 @@ export type SendResult =
 export async function sendMessage(id: string, text: string, expectBuyer?: string, dryRun = false): Promise<SendResult> {
   return withTab(async (page) => {
     const { row, canWrite } = await openThread(page, id);
+    // Only Marketplace threads (buyer · listing) can be written to; personal chats are read-only here.
+    if (!row.listing) throw new Error(`Thread ${id} (${row.buyer || "unknown"}) is not a Marketplace conversation. Nothing was sent.`);
     if (!canWrite) throw new Error(`Thread ${id} (${row.buyer} · ${row.listing}) has no message box: you may have left it. Nothing was sent.`);
     if (expectBuyer && norm(expectBuyer).toLowerCase() !== norm(row.buyer).toLowerCase()) {
       throw new Error(`Thread ${id} belongs to "${row.buyer}", not "${expectBuyer}". Nothing was sent.`);
